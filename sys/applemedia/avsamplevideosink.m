@@ -54,6 +54,8 @@ static GstFlowReturn gst_av_sample_video_sink_show_frame (GstVideoSink * bsink,
 static gboolean gst_av_sample_video_sink_propose_allocation (GstBaseSink * bsink,
     GstQuery * query);
 
+static void gst_avsample_video_sink_overlay_init (GstVideoOverlayInterface * iface);
+
 static GstStaticPadTemplate gst_av_sample_video_sink_template =
     GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK,
@@ -71,7 +73,9 @@ enum
 #define gst_av_sample_video_sink_parent_class parent_class
 G_DEFINE_TYPE_WITH_CODE (GstAVSampleVideoSink, gst_av_sample_video_sink,
     GST_TYPE_VIDEO_SINK, GST_DEBUG_CATEGORY_INIT (gst_debug_av_sink, "avsamplevideosink", 0,
-        "AV Sample Video Sink"));
+        "AV Sample Video Sink");
+    G_IMPLEMENT_INTERFACE (GST_TYPE_VIDEO_OVERLAY,
+        gst_avsample_video_sink_overlay_init));
 
 static void
 gst_av_sample_video_sink_class_init (GstAVSampleVideoSinkClass * klass)
@@ -100,7 +104,7 @@ gst_av_sample_video_sink_class_init (GstAVSampleVideoSinkClass * klass)
   g_object_class_install_property (gobject_class, PROP_LAYER,
       g_param_spec_pointer ("layer", "CALayer",
           "The CoreAnimation layer that can be placed in the render tree",
-          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_set_metadata (element_class, "AV Sample video sink",
       "Sink/Video", "A videosink based on AVSampleBuffers",
@@ -158,16 +162,36 @@ gst_av_sample_video_sink_finalize (GObject * object)
   GstAVSampleVideoSink *av_sink = GST_AV_SAMPLE_VIDEO_SINK (object);
   __block gpointer layer = av_sink->layer;
 
-  if (layer) {
+  if (layer && !av_sink->ca_layer_handler) {
+    GST_DEBUG_OBJECT(av_sink, " release layer which is allocated by plugin");
     dispatch_async (dispatch_get_main_queue (), ^{
       CFBridgingRelease(layer);
     });
+  } else {
+    GST_DEBUG_OBJECT(av_sink, " no need to release layer which is not allocated by plugin");
+    av_sink->ca_layer_handler = NULL;
   }
 
   g_mutex_clear (&av_sink->render_lock);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
+
+static void
+gst_avsample_video_sink_set_window_handle (GstVideoOverlay * voverlay, guintptr handle)
+{
+  GstAVSampleVideoSink *av_sink = GST_AV_SAMPLE_VIDEO_SINK (voverlay);
+  GST_DEBUG_OBJECT(av_sink, "Set CALayer from application");
+  av_sink->ca_layer_handler = handle;
+}
+
+static void
+gst_avsample_video_sink_overlay_init (GstVideoOverlayInterface * iface)
+{
+  GST_DEBUG(" Initialize the video overlay");
+  iface->set_window_handle = gst_avsample_video_sink_set_window_handle;
+}
+
 
 static void
 gst_av_sample_video_sink_get_property (GObject * object, guint prop_id,
@@ -197,26 +221,36 @@ gst_av_sample_video_sink_start (GstBaseSink * bsink)
 {
   GstAVSampleVideoSink *av_sink = GST_AV_SAMPLE_VIDEO_SINK (bsink);
 
-  if ([NSThread isMainThread]) {
-      AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
-    av_sink->layer = (__bridge_retained gpointer)layer;
-    if (av_sink->keep_aspect_ratio)
-      layer.videoGravity = AVLayerVideoGravityResizeAspect;
-    else
-      layer.videoGravity = AVLayerVideoGravityResize;
-    g_object_notify (G_OBJECT (av_sink), "layer");
-  } else {
-    dispatch_sync (dispatch_get_main_queue (), ^{
-      AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
+  if (!av_sink->ca_layer_handler) {
+        GST_DEBUG_OBJECT (av_sink, "calling application to get layer ");
+    gst_video_overlay_prepare_window_handle (GST_VIDEO_OVERLAY (av_sink));
+  }
+
+  if(!av_sink->ca_layer_handler) {
+    GST_DEBUG_OBJECT(av_sink," allocate layer in plugin ");
+    if ([NSThread isMainThread]) {
+        AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
       av_sink->layer = (__bridge_retained gpointer)layer;
       if (av_sink->keep_aspect_ratio)
         layer.videoGravity = AVLayerVideoGravityResizeAspect;
       else
         layer.videoGravity = AVLayerVideoGravityResize;
       g_object_notify (G_OBJECT (av_sink), "layer");
-    });
+    } else {
+      dispatch_sync (dispatch_get_main_queue (), ^{
+        AVSampleBufferDisplayLayer *layer = [[AVSampleBufferDisplayLayer alloc] init];
+        av_sink->layer = (__bridge_retained gpointer)layer;
+        if (av_sink->keep_aspect_ratio)
+          layer.videoGravity = AVLayerVideoGravityResizeAspect;
+        else
+          layer.videoGravity = AVLayerVideoGravityResize;
+        g_object_notify (G_OBJECT (av_sink), "layer");
+      });
+    }
+  } else {
+    GST_DEBUG_OBJECT(av_sink," received CA layer from application");
+    av_sink->layer = av_sink->ca_layer_handler;
   }
-
   return TRUE;
 }
 

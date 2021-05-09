@@ -64,6 +64,9 @@ struct _GstAVSampleVideoSink
 
     gboolean layer_requesting_data;
 
+    guintptr ca_layer_handler;
+    gboolean own_layer;
+
     GMutex render_lock;
     GstBuffer *buffer;
     GstFlowReturn render_flow_return;

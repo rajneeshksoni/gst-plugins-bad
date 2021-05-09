@@ -24,6 +24,10 @@
 #include <QuartzCore/QuartzCore.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
+#include <AVFoundation/AVFoundation.h>
+#include <gst/video/videooverlay.h>
+
+
 
 #if MAC_OS_X_VERSION_MAX_ALLOWED < 101200
 #define NSWindowStyleMaskBorderless          NSBorderlessWindowMask
@@ -31,6 +35,7 @@
 
 static NSRunLoop *loop;
 static int quit = 0;
+gpointer layer = NULL;
 
 static void
 end_stream_cb(GstBus* bus, GstMessage* message, GstElement* pipeline)
@@ -68,9 +73,30 @@ end_stream_cb(GstBus* bus, GstMessage* message, GstElement* pipeline)
   }
 }
 
+static GstBusSyncReply
+ bus_sync_handler (GstBus * bus, GstMessage * message, gpointer user_data)
+ {
+  GstVideoOverlay *overlay;
+  // ignore anything but 'prepare-window-handle' element messages
+  if (!gst_is_video_overlay_prepare_window_handle_message (message)) {
+    return GST_BUS_PASS;
+  }
+  g_print ("bus message to get the layer!");
+
+  if(layer != NULL) {
+    // GST_MESSAGE_SRC (message) will be the video sink element
+    overlay = GST_VIDEO_OVERLAY (GST_MESSAGE_SRC (message));
+    gst_video_overlay_set_window_handle (overlay, (guintptr)layer);
+  } else {
+      g_warning ("Should have obtained video_window_handle by now!");
+  }
+  gst_message_unref (message);
+  return GST_BUS_DROP;
+ }
+
+
 gint main (gint argc, gchar *argv[])
 {
-  CALayer *layer;
   loop = [NSRunLoop currentRunLoop];
 
   gst_init (&argc, &argv);
@@ -95,15 +121,17 @@ gint main (gint argc, gchar *argv[])
 
   GstBus* bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
 
-  gst_element_set_state (pipeline, GST_STATE_READY);
-  gst_element_get_state (pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
-
-  g_object_get (videosink, "layer", &layer, NULL);
+  gst_bus_set_sync_handler (bus, (GstBusSyncHandler) bus_sync_handler, NULL,
+       NULL);
 
   NSWindow *window = [[NSWindow alloc] initWithContentRect:NSMakeRect (0, 0, 320, 240)
       styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
   [window setOpaque:NO];
   [window.contentView setWantsLayer:YES];
+
+  // Allocate layer
+  AVSampleBufferDisplayLayer *displaylayer = [[AVSampleBufferDisplayLayer alloc] init];
+  layer = (__bridge_retained gpointer)displaylayer;
 
   NSView *view = [window.contentView superview];
   [view setLayer:layer];
@@ -119,8 +147,11 @@ gint main (gint argc, gchar *argv[])
       end_stream_cb (bus, msg, pipeline);
   }
 
+  dispatch_async (dispatch_get_main_queue (), ^{
+    CFBridgingRelease(layer);
+  });
+
   gst_element_set_state (pipeline, GST_STATE_NULL);
-  gst_element_get_state (pipeline, NULL, NULL, GST_CLOCK_TIME_NONE);
   gst_object_unref (bus);
   gst_object_unref (pipeline);
 

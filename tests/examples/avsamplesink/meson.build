@@ -10,5 +10,11 @@ if ['darwin', 'ios'].contains(host_system)
       dependencies : [gst_dep, avfoundation_dep, quartzcore_dep, corefoundation_dep, cocoa_dep],
       c_args : gst_plugins_bad_args,
       install: false)
+    executable('avsampleapplayer', 'avsample-app-layer.m',
+      include_directories : [configinc],
+      dependencies : [gst_dep, gstvideo_dep, gstbase_dep,gstpbutils_dep, avfoundation_dep, quartzcore_dep, corefoundation_dep, cocoa_dep],
+      c_args : gst_plugins_bad_args,
+      install: false)
+
   endif
 endif
