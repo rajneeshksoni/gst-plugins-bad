@@ -22,6 +22,8 @@
 #endif
 
 #include "WPEThreadedView.h"
+#include "gstwpe.h"
+#include "gstwpesrcbin.h"
 
 #include <gst/gl/gl.h>
 #include <gst/gl/egl/gsteglimage.h>
@@ -35,8 +37,8 @@
 #include <wpe/unstable/fdo-shm.h>
 #endif
 
-GST_DEBUG_CATEGORY_EXTERN (wpe_src_debug);
-#define GST_CAT_DEFAULT wpe_src_debug
+GST_DEBUG_CATEGORY_EXTERN (wpe_view_debug);
+#define GST_CAT_DEFAULT wpe_view_debug
 
 #if defined(WPE_FDO_CHECK_VERSION) && WPE_FDO_CHECK_VERSION(1, 3, 0)
 #define USE_DEPRECATED_FDO_EGL_IMAGE 0
@@ -165,7 +167,142 @@ gpointer WPEContextThread::s_viewThread(gpointer data)
     return nullptr;
 }
 
-WPEView* WPEContextThread::createWPEView(GstWpeSrc* src, GstGLContext* context, GstGLDisplay* display, int width, int height)
+#ifdef G_OS_UNIX
+static void
+initialize_web_extensions (WebKitWebContext *context)
+{
+    webkit_web_context_set_web_extensions_directory (context, gst_wpe_get_extension_path ());
+}
+
+static void
+webkit_extension_gerror_msg_received (GstWpeSrc *src, GVariant *params)
+{
+    GstMessage *message;
+    const gchar *message_type, *src_path, *error_domain, *msg, *debug_str, *details_str;
+    guint32 error_code;
+
+    g_variant_get (params, "(sssusss)",
+       &message_type,
+       &src_path,
+       &error_domain,
+       &error_code,
+       &msg,
+       &debug_str,
+       &details_str
+    );
+
+    GError *error = g_error_new(g_quark_from_string(error_domain), error_code, "%s", msg);
+    GstStructure *details = (details_str[0] != '\0') ? gst_structure_new_from_string(details_str) : NULL;
+    gchar * our_message = g_strdup_printf(
+        "`%s` posted from %s running inside the web page",
+        debug_str, src_path
+    );
+
+    if (!details)
+        details = gst_structure_new_empty("wpesrcdetails");
+    gst_structure_set(details,
+                      "wpesrc_original_src_path", G_TYPE_STRING, src_path,
+                      NULL);
+
+    if (!g_strcmp0(message_type, "error")) {
+        message =
+            gst_message_new_error_with_details(GST_OBJECT(src), error,
+                                               our_message, details);
+    } else if (!g_strcmp0(message_type, "warning")) {
+        message =
+            gst_message_new_warning_with_details(GST_OBJECT(src), error,
+                                                 our_message, details);
+    } else {
+        message =
+            gst_message_new_info_with_details(GST_OBJECT(src), error, our_message, details);
+    }
+
+    g_free (our_message);
+    gst_element_post_message(GST_ELEMENT(src), message);
+    g_error_free(error);
+}
+
+static void
+webkit_extension_bus_message_received (GstWpeSrc *src, GVariant *params)
+{
+    GstStructure *structure;
+    const gchar *message_type, *src_name, *src_type, *src_path, *struct_str;
+
+    g_variant_get (params, "(sssss)",
+       &message_type,
+       &src_name,
+       &src_type,
+       &src_path,
+       &struct_str
+    );
+
+    structure = (struct_str[0] != '\0') ? gst_structure_new_from_string(struct_str) : NULL;
+    if (!structure)
+    {
+        if (struct_str[0] != '\0')
+            GST_ERROR_OBJECT(src, "Could not deserialize: %s", struct_str);
+        structure = gst_structure_new_empty("wpesrc");
+    }
+
+    gst_structure_set(structure,
+                      "wpesrc_original_message_type", G_TYPE_STRING, message_type,
+                      "wpesrc_original_src_name", G_TYPE_STRING, src_name,
+                      "wpesrc_original_src_type", G_TYPE_STRING, src_type,
+                      "wpesrc_original_src_path", G_TYPE_STRING, src_path,
+                      NULL);
+
+    gst_element_post_message(GST_ELEMENT(src), gst_message_new_custom(GST_MESSAGE_ELEMENT,
+                                                                      GST_OBJECT(src), structure));
+}
+
+static gboolean
+webkit_extension_msg_received (WebKitWebContext  *context,
+               WebKitUserMessage *message,
+               GstWpeSrc           *src)
+{
+    const gchar *name = webkit_user_message_get_name (message);
+    GVariant *params = webkit_user_message_get_parameters (message);
+    gboolean res = TRUE;
+
+    if (!g_strcmp0(name, "gstwpe.new_stream")) {
+        guint32 id = g_variant_get_uint32 (g_variant_get_child_value (params, 0));
+        const gchar *capsstr = g_variant_get_string (g_variant_get_child_value (params, 1), NULL);
+        GstCaps *caps = gst_caps_from_string (capsstr);
+        const gchar *stream_id = g_variant_get_string (g_variant_get_child_value (params, 2), NULL);
+        gst_wpe_src_new_audio_stream(src, id, caps, stream_id);
+        gst_caps_unref (caps);
+    } else if (!g_strcmp0(name, "gstwpe.set_shm")) {
+        auto fdlist = webkit_user_message_get_fd_list (message);
+        gint id = g_variant_get_uint32 (g_variant_get_child_value (params, 0));
+        gst_wpe_src_set_audio_shm (src, fdlist, id);
+    } else if (!g_strcmp0(name, "gstwpe.new_buffer")) {
+        guint32 id = g_variant_get_uint32 (g_variant_get_child_value (params, 0));
+        guint64 size = g_variant_get_uint64 (g_variant_get_child_value (params, 1));
+        gst_wpe_src_push_audio_buffer (src, id, size);
+
+        webkit_user_message_send_reply(message, webkit_user_message_new ("gstwpe.buffer_processed", NULL));
+    } else if (!g_strcmp0(name, "gstwpe.pause")) {
+        guint32 id = g_variant_get_uint32 (params);
+
+        gst_wpe_src_pause_audio_stream (src, id);
+    } else if (!g_strcmp0(name, "gstwpe.stop")) {
+        guint32 id = g_variant_get_uint32 (params);
+
+        gst_wpe_src_stop_audio_stream (src, id);
+    } else if (!g_strcmp0(name, "gstwpe.bus_gerror_message")) {
+        webkit_extension_gerror_msg_received (src, params);
+    } else if (!g_strcmp0(name, "gstwpe.bus_message")) {
+        webkit_extension_bus_message_received (src, params);
+    } else {
+        res = FALSE;
+        g_error("Unknown event: %s", name);
+    }
+
+    return res;
+}
+#endif
+
+WPEView* WPEContextThread::createWPEView(GstWpeVideoSrc* src, GstGLContext* context, GstGLDisplay* display, int width, int height)
 {
     GST_DEBUG("context %p display %p, size (%d,%d)", context, display, width, height);
 
@@ -179,13 +316,11 @@ WPEView* WPEContextThread::createWPEView(GstWpeSrc* src, GstGLContext* context, 
 
     WPEView* view = nullptr;
     dispatch([&]() mutable {
-        if (!glib.web_context) {
-            auto* manager = webkit_website_data_manager_new_ephemeral();
-            glib.web_context = webkit_web_context_new_with_website_data_manager(manager);
-            g_object_unref(manager);
-        }
+        auto* manager = webkit_website_data_manager_new_ephemeral();
+        auto web_context = webkit_web_context_new_with_website_data_manager(manager);
+        g_object_unref(manager);
 
-        view = new WPEView(glib.web_context, src, context, display, width, height);
+        view = new WPEView(web_context, src, context, display, width, height);
     });
 
     if (view && view->hasUri()) {
@@ -199,7 +334,7 @@ WPEView* WPEContextThread::createWPEView(GstWpeSrc* src, GstGLContext* context, 
 
 static gboolean s_loadFailed(WebKitWebView*, WebKitLoadEvent, gchar* failing_uri, GError* error, gpointer data)
 {
-    GstWpeSrc* src = GST_WPE_SRC(data);
+    GstWpeVideoSrc* src = GST_WPE_VIDEO_SRC(data);
 
     if (g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED)) {
         GST_INFO_OBJECT (src, "Loading cancelled.");
@@ -231,28 +366,50 @@ static void s_loadProgressChaned(GObject* object, GParamSpec*, gpointer data)
     gst_object_unref (bus);
 }
 
-WPEView::WPEView(WebKitWebContext* web_context, GstWpeSrc* src, GstGLContext* context, GstGLDisplay* display, int width, int height)
+WPEView::WPEView(WebKitWebContext* web_context, GstWpeVideoSrc* src, GstGLContext* context, GstGLDisplay* display, int width, int height)
 {
+#ifdef G_OS_UNIX
+{
+        GstObject *parent = gst_object_get_parent (GST_OBJECT (src));
+
+        if (parent && GST_IS_WPE_SRC (parent)) {
+            audio.init_ext_sigid = g_signal_connect (web_context,
+                              "initialize-web-extensions",
+                              G_CALLBACK (initialize_web_extensions),
+                              NULL);
+            audio.extension_msg_sigid = g_signal_connect (web_context,
+                                "user-message-received",
+                                G_CALLBACK (webkit_extension_msg_received),
+                                parent);
+            GST_INFO_OBJECT (parent, "Enabled audio");
+        }
+
+        gst_clear_object (&parent);
+}
+#endif // G_OS_UNIX
+
     g_mutex_init(&threading.ready_mutex);
     g_cond_init(&threading.ready_cond);
     threading.ready = FALSE;
 
     g_mutex_init(&images_mutex);
-    if (context)
-        gst.context = GST_GL_CONTEXT(gst_object_ref(context));
-    if (display) {
-        gst.display = GST_GL_DISPLAY(gst_object_ref(display));
-    }
+    if (g_strcmp0(g_getenv("LIBGL_ALWAYS_SOFTWARE"), "true")) {
+        if (context)
+            gst.context = GST_GL_CONTEXT(gst_object_ref(context));
+        if (display) {
+            gst.display = GST_GL_DISPLAY(gst_object_ref(display));
+        }
 
-    wpe.width = width;
-    wpe.height = height;
+        wpe.width = width;
+        wpe.height = height;
 
-    if (context && display) {
-      if (gst_gl_context_get_gl_platform(context) == GST_GL_PLATFORM_EGL) {
-        gst.display_egl = gst_gl_display_egl_from_gl_display (gst.display);
-      } else {
-        GST_DEBUG ("Available GStreamer GL Context is not EGL - not creating an EGL display from it");
-      }
+        if (context && display) {
+            if (gst_gl_context_get_gl_platform(context) == GST_GL_PLATFORM_EGL) {
+                gst.display_egl = gst_gl_display_egl_from_gl_display (gst.display);
+            } else {
+                GST_DEBUG ("Available GStreamer GL Context is not EGL - not creating an EGL display from it");
+            }
+        }
     }
 
     if (gst.display_egl) {
@@ -286,13 +443,19 @@ WPEView::WPEView(WebKitWebContext* web_context, GstWpeSrc* src, GstGLContext* co
     wpe_view_backend_add_activity_state(wpeViewBackend, wpe_view_activity_state_visible | wpe_view_activity_state_focused | wpe_view_activity_state_in_window);
 #endif
 
-    webkit.view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "web-context", web_context, "backend", viewBackend, nullptr));
+    webkit.view = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW,
+        "web-context", web_context,
+        "backend", viewBackend,
+        nullptr));
 
     g_signal_connect(webkit.view, "load-failed", G_CALLBACK(s_loadFailed), src);
     g_signal_connect(webkit.view, "load-failed-with-tls-errors", G_CALLBACK(s_loadFailedWithTLSErrors), src);
     g_signal_connect(webkit.view, "notify::estimated-load-progress", G_CALLBACK(s_loadProgressChaned), src);
 
-    gst_wpe_src_configure_web_view(src, webkit.view);
+    auto* settings = webkit_web_view_get_settings(webkit.view);
+    webkit_settings_set_enable_webaudio(settings, TRUE);
+
+    gst_wpe_video_src_configure_web_view(src, webkit.view);
 
     gchar* location;
     gboolean drawBackground = TRUE;
@@ -346,6 +509,15 @@ WPEView::~WPEView()
         gst_buffer_unref (shm_pending);
     if (shm_committed)
         gst_buffer_unref (shm_committed);
+
+    if (audio.init_ext_sigid) {
+        WebKitWebContext* web_context = webkit_web_view_get_context (webkit.view);
+
+        g_signal_handler_disconnect(web_context, audio.init_ext_sigid);
+        g_signal_handler_disconnect(web_context, audio.extension_msg_sigid);
+        audio.init_ext_sigid = 0;
+        audio.extension_msg_sigid = 0;
+    }
 
     WPEContextThread::singleton().dispatch([&]() {
         if (webkit.view) {

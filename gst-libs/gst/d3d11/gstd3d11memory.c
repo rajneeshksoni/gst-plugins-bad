@@ -232,8 +232,16 @@ gst_d3d11_allocation_params_init (GType type)
 
 /* GstD3D11Memory */
 #define GST_D3D11_MEMORY_GET_LOCK(m) (&(GST_D3D11_MEMORY_CAST(m)->priv->lock))
-#define GST_D3D11_MEMORY_LOCK(m) g_mutex_lock(GST_D3D11_MEMORY_GET_LOCK(m))
-#define GST_D3D11_MEMORY_UNLOCK(m) g_mutex_unlock(GST_D3D11_MEMORY_GET_LOCK(m))
+#define GST_D3D11_MEMORY_LOCK(m) G_STMT_START { \
+  GST_TRACE("Locking %p from thread %p", (m), g_thread_self()); \
+  g_mutex_lock(GST_D3D11_MEMORY_GET_LOCK(m)); \
+  GST_TRACE("Locked %p from thread %p", (m), g_thread_self()); \
+} G_STMT_END
+
+#define GST_D3D11_MEMORY_UNLOCK(m) G_STMT_START { \
+  GST_TRACE("Unlocking %p from thread %p", (m), g_thread_self()); \
+  g_mutex_unlock(GST_D3D11_MEMORY_GET_LOCK(m)); \
+} G_STMT_END
 
 struct _GstD3D11MemoryPrivate
 {
@@ -305,6 +313,7 @@ gst_d3d11_allocate_staging_texture (GstD3D11Device * device,
   return texture;
 }
 
+/* Must be called with d3d11 device lock */
 static gboolean
 gst_d3d11_memory_map_cpu_access (GstD3D11Memory * dmem, D3D11_MAP map_type)
 {
@@ -314,10 +323,8 @@ gst_d3d11_memory_map_cpu_access (GstD3D11Memory * dmem, D3D11_MAP map_type)
   ID3D11DeviceContext *device_context =
       gst_d3d11_device_get_device_context_handle (dmem->device);
 
-  gst_d3d11_device_lock (dmem->device);
   hr = ID3D11DeviceContext_Map (device_context,
       staging, 0, map_type, 0, &priv->map);
-  gst_d3d11_device_unlock (dmem->device);
 
   if (!gst_d3d11_result (hr, dmem->device)) {
     GST_ERROR_OBJECT (GST_MEMORY_CAST (dmem)->allocator,
@@ -328,6 +335,7 @@ gst_d3d11_memory_map_cpu_access (GstD3D11Memory * dmem, D3D11_MAP map_type)
   return TRUE;
 }
 
+/* Must be called with d3d11 device lock */
 static void
 gst_d3d11_memory_upload (GstD3D11Memory * dmem)
 {
@@ -339,13 +347,12 @@ gst_d3d11_memory_upload (GstD3D11Memory * dmem)
     return;
 
   device_context = gst_d3d11_device_get_device_context_handle (dmem->device);
-  gst_d3d11_device_lock (dmem->device);
   ID3D11DeviceContext_CopySubresourceRegion (device_context,
       (ID3D11Resource *) priv->texture, priv->subresource_index, 0, 0, 0,
       (ID3D11Resource *) priv->staging, 0, NULL);
-  gst_d3d11_device_unlock (dmem->device);
 }
 
+/* Must be called with d3d11 device lock */
 static void
 gst_d3d11_memory_download (GstD3D11Memory * dmem)
 {
@@ -357,11 +364,9 @@ gst_d3d11_memory_download (GstD3D11Memory * dmem)
     return;
 
   device_context = gst_d3d11_device_get_device_context_handle (dmem->device);
-  gst_d3d11_device_lock (dmem->device);
   ID3D11DeviceContext_CopySubresourceRegion (device_context,
       (ID3D11Resource *) priv->staging, 0, 0, 0, 0,
       (ID3D11Resource *) priv->texture, priv->subresource_index, NULL);
-  gst_d3d11_device_unlock (dmem->device);
 }
 
 static gpointer
@@ -370,8 +375,11 @@ gst_d3d11_memory_map_full (GstMemory * mem, GstMapInfo * info, gsize maxsize)
   GstD3D11Memory *dmem = GST_D3D11_MEMORY_CAST (mem);
   GstD3D11MemoryPrivate *priv = dmem->priv;
   GstMapFlags flags = info->flags;
+  gpointer ret = NULL;
 
+  gst_d3d11_device_lock (dmem->device);
   GST_D3D11_MEMORY_LOCK (dmem);
+
   if ((flags & GST_MAP_D3D11) == GST_MAP_D3D11) {
     gst_d3d11_memory_upload (dmem);
     GST_MEMORY_FLAG_UNSET (dmem, GST_D3D11_MEMORY_TRANSFER_NEED_UPLOAD);
@@ -380,9 +388,8 @@ gst_d3d11_memory_map_full (GstMemory * mem, GstMapInfo * info, gsize maxsize)
       GST_MINI_OBJECT_FLAG_SET (dmem, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
 
     g_assert (priv->texture != NULL);
-    GST_D3D11_MEMORY_UNLOCK (dmem);
-
-    return priv->texture;
+    ret = priv->texture;
+    goto out;
   }
 
   if (priv->cpu_map_count == 0) {
@@ -394,9 +401,7 @@ gst_d3d11_memory_map_full (GstMemory * mem, GstMapInfo * info, gsize maxsize)
           &priv->desc);
       if (!priv->staging) {
         GST_ERROR_OBJECT (mem->allocator, "Couldn't create staging texture");
-        GST_D3D11_MEMORY_UNLOCK (dmem);
-
-        return NULL;
+        goto out;
       }
 
       /* first memory, always need download to staging */
@@ -408,9 +413,7 @@ gst_d3d11_memory_map_full (GstMemory * mem, GstMapInfo * info, gsize maxsize)
 
     if (!gst_d3d11_memory_map_cpu_access (dmem, map_type)) {
       GST_ERROR_OBJECT (mem->allocator, "Couldn't map staging texture");
-      GST_D3D11_MEMORY_UNLOCK (dmem);
-
-      return NULL;
+      goto out;
     }
   }
 
@@ -421,11 +424,16 @@ gst_d3d11_memory_map_full (GstMemory * mem, GstMapInfo * info, gsize maxsize)
   GST_MEMORY_FLAG_UNSET (mem, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
 
   priv->cpu_map_count++;
-  GST_D3D11_MEMORY_UNLOCK (dmem);
+  ret = dmem->priv->map.pData;
 
-  return dmem->priv->map.pData;
+out:
+  GST_D3D11_MEMORY_UNLOCK (dmem);
+  gst_d3d11_device_unlock (dmem->device);
+
+  return ret;
 }
 
+/* Must be called with d3d11 device lock */
 static void
 gst_d3d11_memory_unmap_cpu_access (GstD3D11Memory * dmem)
 {
@@ -434,9 +442,7 @@ gst_d3d11_memory_unmap_cpu_access (GstD3D11Memory * dmem)
   ID3D11DeviceContext *device_context =
       gst_d3d11_device_get_device_context_handle (dmem->device);
 
-  gst_d3d11_device_lock (dmem->device);
   ID3D11DeviceContext_Unmap (device_context, staging, 0);
-  gst_d3d11_device_unlock (dmem->device);
 }
 
 static void
@@ -445,26 +451,28 @@ gst_d3d11_memory_unmap_full (GstMemory * mem, GstMapInfo * info)
   GstD3D11Memory *dmem = GST_D3D11_MEMORY_CAST (mem);
   GstD3D11MemoryPrivate *priv = dmem->priv;
 
+  gst_d3d11_device_lock (dmem->device);
   GST_D3D11_MEMORY_LOCK (dmem);
+
   if ((info->flags & GST_MAP_D3D11) == GST_MAP_D3D11) {
     if ((info->flags & GST_MAP_WRITE) == GST_MAP_WRITE)
       GST_MINI_OBJECT_FLAG_SET (mem, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
 
-    GST_D3D11_MEMORY_UNLOCK (dmem);
-    return;
+    goto out;
   }
 
   if ((info->flags & GST_MAP_WRITE) == GST_MAP_WRITE)
     GST_MINI_OBJECT_FLAG_SET (mem, GST_D3D11_MEMORY_TRANSFER_NEED_UPLOAD);
 
   priv->cpu_map_count--;
-  if (priv->cpu_map_count > 0) {
-    GST_D3D11_MEMORY_UNLOCK (dmem);
-    return;
-  }
+  if (priv->cpu_map_count > 0)
+    goto out;
 
   gst_d3d11_memory_unmap_cpu_access (dmem);
+
+out:
   GST_D3D11_MEMORY_UNLOCK (dmem);
+  gst_d3d11_device_unlock (dmem->device);
 }
 
 static GstMemory *
@@ -483,6 +491,7 @@ gst_d3d11_memory_update_size (GstMemory * mem)
   gint stride[GST_VIDEO_MAX_PLANES];
   gsize size;
   D3D11_TEXTURE2D_DESC *desc = &priv->desc;
+  gboolean ret = FALSE;
 
   if (!priv->staging) {
     priv->staging = gst_d3d11_allocate_staging_texture (dmem->device,
@@ -495,6 +504,7 @@ gst_d3d11_memory_update_size (GstMemory * mem)
     GST_MINI_OBJECT_FLAG_SET (mem, GST_D3D11_MEMORY_TRANSFER_NEED_DOWNLOAD);
   }
 
+  gst_d3d11_device_lock (dmem->device);
   if (!gst_d3d11_memory_map_cpu_access (dmem, D3D11_MAP_READ_WRITE)) {
     GST_ERROR_OBJECT (mem->allocator, "Couldn't map staging texture");
     return FALSE;
@@ -505,12 +515,15 @@ gst_d3d11_memory_update_size (GstMemory * mem)
   if (!gst_d3d11_dxgi_format_get_size (desc->Format, desc->Width, desc->Height,
           priv->map.RowPitch, offset, stride, &size)) {
     GST_ERROR_OBJECT (mem->allocator, "Couldn't calculate memory size");
-    return FALSE;
+    goto out;
   }
 
   mem->maxsize = mem->size = size;
+  ret = TRUE;
 
-  return TRUE;
+out:
+  gst_d3d11_device_unlock (dmem->device);
+  return ret;
 }
 
 /**

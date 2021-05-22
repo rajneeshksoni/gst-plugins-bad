@@ -15,6 +15,7 @@ option('audiovisualizers', type : 'feature', value : 'auto')
 option('autoconvert', type : 'feature', value : 'auto')
 option('bayer', type : 'feature', value : 'auto')
 option('camerabin2', type : 'feature', value : 'auto')
+option('codecalpha', type : 'feature', value : 'auto')
 option('coloreffects', type : 'feature', value : 'auto')
 option('debugutils', type : 'feature', value : 'auto')
 option('dvbsubenc', type : 'feature', value : 'auto')
@@ -184,6 +185,10 @@ option('hls-crypto', type : 'combo', value : 'auto', choices : ['auto', 'nettle'
 # SCTP plugin options
 option('sctp-internal-usrsctp', type: 'feature', value : 'enabled',
        description: 'Whether to use the bundled usrsctp library or the system one')
+
+# MSDK plugin options
+option('mfx_api', type : 'combo', choices : ['MSDK', 'oneVPL', 'auto'], value : 'auto',
+       description : 'Select MFX API to build against')
 
 # Common feature options
 option('examples', type : 'feature', value : 'auto', yield : true)

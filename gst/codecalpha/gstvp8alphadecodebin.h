@@ -1,6 +1,6 @@
 /* GStreamer
- * Copyright (C) 2020 Igalia, S.L.
- *     Author: Víctor Jáquez <vjaquez@igalia.com>
+ * Copyright (C) <2021> Collabora Ltd.
+ *   Author: Nicolas Dufresne <nicolas.dufresne@collabora.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -18,16 +18,18 @@
  * Boston, MA 02110-1301, USA.
  */
 
-#pragma once
+#ifndef __GST_VP8_ALPHA_DECODE_BIN_H__
+#define __GST_VP8_ALPHA_DECODE_BIN_H__
 
-#include "gstvadisplay.h"
+#include "gstalphadecodebin.h"
 
 G_BEGIN_DECLS
 
-#define GST_TYPE_VA_DISPLAY_WRAPPED gst_va_display_wrapped_get_type()
-G_DECLARE_FINAL_TYPE (GstVaDisplayWrapped, gst_va_display_wrapped, GST,
-    VA_DISPLAY_WRAPPED, GstVaDisplay)
+#define GST_TYPE_VP8_ALPHA_DECODE_BIN (gst_vp8_alpha_decode_bin_get_type())
+G_DECLARE_FINAL_TYPE (GstVp8AlphaDecodeBin, gst_vp8_alpha_decode_bin,
+    GST, VP8_ALPHA_DECODE_BIN, GstAlphaDecodeBin);
 
-GstVaDisplay *        gst_va_display_wrapped_new  (guintptr handle);
+GST_ELEMENT_REGISTER_DECLARE (vp8_alpha_decode_bin);
 
 G_END_DECLS
+#endif

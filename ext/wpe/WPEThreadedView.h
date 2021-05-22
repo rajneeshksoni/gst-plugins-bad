@@ -26,7 +26,7 @@
 #include <wpe/fdo.h>
 #include <wpe/fdo-egl.h>
 #include <wpe/webkit.h>
-#include "gstwpesrc.h"
+#include "gstwpevideosrc.h"
 
 typedef struct _GstGLContext GstGLContext;
 typedef struct _GstGLDisplay GstGLDisplay;
@@ -40,16 +40,17 @@ typedef struct _GstEGLImage GstEGLImage;
 
 class WPEView {
 public:
-    WPEView(WebKitWebContext*, GstWpeSrc*, GstGLContext*, GstGLDisplay*, int width, int height);
+    WPEView(WebKitWebContext*, GstWpeVideoSrc*, GstGLContext*, GstGLDisplay*, int width, int height);
     ~WPEView();
 
     bool operator!() const { return m_isValid; }
 
-    /*  Used by wpesrc */
+    /*  Used by wpevideosrc */
     void resize(int width, int height);
     void loadUri(const gchar*);
     void loadData(GBytes*);
     void setDrawBackground(gboolean);
+
     GstEGLImage* image();
     GstBuffer* buffer();
 
@@ -96,7 +97,7 @@ private:
         struct wpe_view_backend_exportable_fdo* exportable;
         int width;
         int height;
-    } wpe { nullptr, 0, 0 };
+    } wpe { nullptr, 0, 0, };
 
     struct {
         gchar* uri;
@@ -125,6 +126,11 @@ private:
         GstBuffer* committed;
     } shm { nullptr, nullptr };
 
+    struct {
+        gulong init_ext_sigid;
+        gulong extension_msg_sigid;
+    } audio {0, 0};
+
 };
 
 class WPEContextThread {
@@ -134,7 +140,7 @@ public:
     WPEContextThread();
     ~WPEContextThread();
 
-    WPEView* createWPEView(GstWpeSrc*, GstGLContext*, GstGLDisplay*, int width, int height);
+    WPEView* createWPEView(GstWpeVideoSrc*, GstGLContext*, GstGLDisplay*, int width, int height);
 
     template<typename Function>
     void dispatch(Function);

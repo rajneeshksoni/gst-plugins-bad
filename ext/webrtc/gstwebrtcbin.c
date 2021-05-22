@@ -55,9 +55,14 @@
 #define ICE_LOCK(w) (g_mutex_lock (ICE_GET_LOCK(w)))
 #define ICE_UNLOCK(w) (g_mutex_unlock (ICE_GET_LOCK(w)))
 
+#define DC_GET_LOCK(w) (&w->priv->dc_lock)
+#define DC_LOCK(w) (g_mutex_lock (DC_GET_LOCK(w)))
+#define DC_UNLOCK(w) (g_mutex_unlock (DC_GET_LOCK(w)))
 
 /* The extra time for the rtpstorage compared to the RTP jitterbuffer (in ms) */
 #define RTPSTORAGE_EXTRA_TIME (50)
+
+#define DEFAULT_JB_LATENCY 200
 
 /**
  * SECTION: element-webrtcbin
@@ -307,6 +312,80 @@ gst_webrtcbin_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
   return gst_pad_event_default (pad, parent, event);
 }
 
+static gboolean
+gst_webrtcbin_sink_query (GstPad * pad, GstObject * parent, GstQuery * query)
+{
+  GstWebRTCBinPad *wpad = GST_WEBRTC_BIN_PAD (pad);
+  gboolean ret = FALSE;
+
+  switch (GST_QUERY_TYPE (query)) {
+    case GST_QUERY_ACCEPT_CAPS:
+      GST_OBJECT_LOCK (wpad->trans);
+      if (wpad->trans->codec_preferences) {
+        GstCaps *caps;
+
+        gst_query_parse_accept_caps (query, &caps);
+
+        gst_query_set_accept_caps_result (query,
+            gst_caps_can_intersect (caps, wpad->trans->codec_preferences));
+        ret = TRUE;
+      }
+      GST_OBJECT_UNLOCK (wpad->trans);
+      break;
+
+    case GST_QUERY_CAPS:
+    {
+      GstCaps *codec_preferences = NULL;
+
+      GST_OBJECT_LOCK (wpad->trans);
+      if (wpad->trans->codec_preferences)
+        codec_preferences = gst_caps_ref (wpad->trans->codec_preferences);
+      GST_OBJECT_UNLOCK (wpad->trans);
+
+      if (codec_preferences) {
+        GstCaps *filter = NULL;
+        GstCaps *filter_prefs = NULL;
+        GstPad *target;
+
+        gst_query_parse_caps (query, &filter);
+
+        if (filter) {
+          filter_prefs = gst_caps_intersect_full (filter, codec_preferences,
+              GST_CAPS_INTERSECT_FIRST);
+          gst_caps_unref (codec_preferences);
+        } else {
+          filter_prefs = codec_preferences;
+        }
+
+        target = gst_ghost_pad_get_target (GST_GHOST_PAD (pad));
+        if (target) {
+          GstCaps *result;
+
+          result = gst_pad_query_caps (target, filter_prefs);
+          gst_query_set_caps_result (query, result);
+          gst_caps_unref (result);
+
+          gst_object_unref (target);
+        } else {
+          gst_query_set_caps_result (query, filter_prefs);
+        }
+
+        gst_caps_unref (filter_prefs);
+        ret = TRUE;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  if (ret)
+    return TRUE;
+
+  return gst_pad_query_default (pad, parent, query);
+}
+
+
 static void
 gst_webrtc_bin_pad_init (GstWebRTCBinPad * pad)
 {
@@ -331,6 +410,7 @@ gst_webrtc_bin_pad_new (const gchar * name, GstPadDirection direction)
   gst_object_unref (template);
 
   gst_pad_set_event_function (GST_PAD (pad), gst_webrtcbin_sink_event);
+  gst_pad_set_query_function (GST_PAD (pad), gst_webrtcbin_sink_query);
 
   GST_DEBUG_OBJECT (pad, "new visible pad with direction %s",
       direction == GST_PAD_SRC ? "src" : "sink");
@@ -579,6 +659,7 @@ data_channel_match_for_id (WebRTCDataChannel * channel, gint * id)
   return channel->parent.id == *id;
 }
 
+/* always called with dc_lock held */
 static WebRTCDataChannel *
 _find_data_channel_for_id (GstWebRTCBin * webrtc, gint id)
 {
@@ -1495,73 +1576,153 @@ _update_need_negotiation (GstWebRTCBin * webrtc)
 }
 
 static GstCaps *
+_query_pad_caps (GstWebRTCBin * webrtc, GstWebRTCRTPTransceiver * rtp_trans,
+    GstWebRTCBinPad * pad, GstCaps * filter, GError ** error)
+{
+  GstCaps *caps;
+
+  caps = gst_pad_peer_query_caps (GST_PAD (pad), filter);
+  GST_LOG_OBJECT (webrtc, "Using peer query caps: %" GST_PTR_FORMAT, caps);
+
+  if (gst_caps_is_empty (caps)) {
+    g_set_error (error, GST_WEBRTC_BIN_ERROR,
+        GST_WEBRTC_BIN_ERROR_CAPS_NEGOTIATION_FAILED,
+        "Caps negotiation on pad %s failed", GST_PAD_NAME (pad));
+    gst_clear_caps (&caps);
+  } else if (!gst_caps_is_fixed (caps) || gst_caps_is_equal (caps, filter)
+      || gst_caps_is_empty (caps) || gst_caps_is_any (caps)) {
+    gst_clear_caps (&caps);
+  }
+
+  gst_caps_unref (filter);
+
+  return caps;
+}
+
+static GstCaps *
 _find_codec_preferences (GstWebRTCBin * webrtc,
-    GstWebRTCRTPTransceiver * rtp_trans, GstPadDirection direction,
-    guint media_idx)
+    GstWebRTCRTPTransceiver * rtp_trans, guint media_idx, GError ** error)
 {
   WebRTCTransceiver *trans = (WebRTCTransceiver *) rtp_trans;
   GstCaps *ret = NULL;
+  GstCaps *codec_preferences = NULL;
+  GstWebRTCBinPad *pad = NULL;
+  GstPadDirection direction;
+
+  g_assert (rtp_trans);
+  g_assert (error && *error == NULL);
 
   GST_LOG_OBJECT (webrtc, "retrieving codec preferences from %" GST_PTR_FORMAT,
       trans);
 
-  if (rtp_trans && rtp_trans->codec_preferences) {
+  GST_OBJECT_LOCK (rtp_trans);
+  if (rtp_trans->codec_preferences) {
     GST_LOG_OBJECT (webrtc, "Using codec preferences: %" GST_PTR_FORMAT,
         rtp_trans->codec_preferences);
-    ret = gst_caps_ref (rtp_trans->codec_preferences);
-  } else {
-    GstWebRTCBinPad *pad = NULL;
+    codec_preferences = gst_caps_ref (rtp_trans->codec_preferences);
+  }
+  GST_OBJECT_UNLOCK (rtp_trans);
+
+  if (rtp_trans->direction == GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_RECVONLY)
+    direction = GST_PAD_SRC;
+  else
+    direction = GST_PAD_SINK;
+
+  pad = _find_pad_for_transceiver (webrtc, direction, rtp_trans);
+
+  /* try to find a pad */
+  if (!pad)
+    pad = _find_pad_for_mline (webrtc, direction, media_idx);
+
+  /* For the case where we have set our transceiver to sendrecv, but the
+   * sink pad has not been requested yet.
+   */
+  if (!pad &&
+      rtp_trans->direction == GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDRECV) {
+
+    pad = _find_pad_for_transceiver (webrtc, GST_PAD_SRC, rtp_trans);
 
     /* try to find a pad */
-    if (!trans
-        || !(pad = _find_pad_for_transceiver (webrtc, direction, rtp_trans)))
-      pad = _find_pad_for_mline (webrtc, direction, media_idx);
+    if (!pad)
+      pad = _find_pad_for_mline (webrtc, GST_PAD_SRC, media_idx);
+  }
 
-    if (!pad) {
-      if (trans && trans->last_configured_caps)
-        ret = gst_caps_ref (trans->last_configured_caps);
+  if (pad) {
+    GstCaps *caps = NULL;
+
+    if (pad->received_caps) {
+      caps = gst_caps_ref (pad->received_caps);
     } else {
-      GstCaps *caps = NULL;
+      static GstStaticCaps static_filter =
+          GST_STATIC_CAPS ("application/x-rtp, "
+          "media = (string) { audio, video }, payload = (int) [ 0, 127 ]");
+      GstCaps *filter = gst_static_caps_get (&static_filter);
 
-      if (pad->received_caps) {
-        caps = gst_caps_ref (pad->received_caps);
-      } else if ((caps = gst_pad_get_current_caps (GST_PAD (pad)))) {
-        GST_LOG_OBJECT (webrtc, "Using current pad caps: %" GST_PTR_FORMAT,
-            caps);
+      filter = gst_caps_make_writable (filter);
+
+      if (rtp_trans->kind == GST_WEBRTC_KIND_AUDIO)
+        gst_caps_set_simple (filter, "media", G_TYPE_STRING, "audio", NULL);
+      else if (rtp_trans->kind == GST_WEBRTC_KIND_VIDEO)
+        gst_caps_set_simple (filter, "media", G_TYPE_STRING, "video", NULL);
+
+      caps = _query_pad_caps (webrtc, rtp_trans, pad, filter, error);
+    }
+    gst_object_unref (pad);
+
+    if (*error)
+      goto out;
+
+    if (caps &&
+        rtp_trans->direction == GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDRECV) {
+      GstWebRTCBinPad *srcpad =
+          _find_pad_for_transceiver (webrtc, GST_PAD_SRC, rtp_trans);
+
+      if (srcpad) {
+        caps = _query_pad_caps (webrtc, rtp_trans, srcpad, caps, error);
+        gst_object_unref (srcpad);
+
+        if (*error)
+          goto out;
+      }
+    }
+
+    if (caps && codec_preferences) {
+      GstCaps *intersection;
+
+      intersection = gst_caps_intersect_full (codec_preferences, caps,
+          GST_CAPS_INTERSECT_FIRST);
+      gst_clear_caps (&caps);
+
+      if (gst_caps_is_empty (intersection)) {
+        g_set_error (error, GST_WEBRTC_BIN_ERROR,
+            GST_WEBRTC_BIN_ERROR_CAPS_NEGOTIATION_FAILED,
+            "Caps negotiation on pad %s failed againt codec preferences",
+            GST_PAD_NAME (pad));
+        gst_clear_caps (&intersection);
       } else {
-        static GstStaticCaps static_filter =
-            GST_STATIC_CAPS ("application/x-rtp, "
-            "media = (string) { audio, video }, payload = (int) [ 0, 127 ]");
-        GstCaps *filter = gst_static_caps_get (&static_filter);
-
-        filter = gst_caps_make_writable (filter);
-
-        if (rtp_trans->kind == GST_WEBRTC_KIND_AUDIO)
-          gst_caps_set_simple (filter, "media", G_TYPE_STRING, "audio", NULL);
-        else if (rtp_trans->kind == GST_WEBRTC_KIND_VIDEO)
-          gst_caps_set_simple (filter, "media", G_TYPE_STRING, "video", NULL);
-
-        caps = gst_pad_peer_query_caps (GST_PAD (pad), filter);
-        GST_LOG_OBJECT (webrtc, "Using peer query caps: %" GST_PTR_FORMAT,
-            caps);
-
-        if (!gst_caps_is_fixed (caps) || gst_caps_is_equal (caps, filter)
-            || gst_caps_is_empty (caps) || gst_caps_is_any (caps)) {
-          gst_caps_unref (caps);
-          caps = NULL;
-        }
-        gst_caps_unref (filter);
+        caps = intersection;
       }
-      if (caps) {
-        if (trans)
-          gst_caps_replace (&trans->last_configured_caps, caps);
+    }
 
-        ret = caps;
-      }
+    if (caps) {
+      if (trans)
+        gst_caps_replace (&trans->last_configured_caps, caps);
 
-      gst_object_unref (pad);
+      ret = caps;
     }
   }
+
+  if (!ret) {
+    if (codec_preferences)
+      ret = gst_caps_ref (codec_preferences);
+    else if (trans->last_configured_caps)
+      ret = gst_caps_ref (trans->last_configured_caps);
+  }
+
+out:
+
+  if (codec_preferences)
+    gst_caps_unref (codec_preferences);
 
   if (!ret)
     GST_DEBUG_OBJECT (trans, "Could not find caps for mline %u", media_idx);
@@ -1801,12 +1962,14 @@ gst_webrtc_bin_update_sctp_priority (GstWebRTCBin * webrtc)
   if (!webrtc->priv->sctp_transport)
     return;
 
+  DC_LOCK (webrtc);
   for (i = 0; i < webrtc->priv->data_channels->len; i++) {
     GstWebRTCDataChannel *channel
         = g_ptr_array_index (webrtc->priv->data_channels, i);
 
     sctp_priority = MAX (sctp_priority, channel->priority);
   }
+  DC_UNLOCK (webrtc);
 
   /* Default priority is low means DSCP field is left as 0 */
   if (sctp_priority == 0)
@@ -1955,34 +2118,38 @@ _on_data_channel_ready_state (WebRTCDataChannel * channel,
     GParamSpec * pspec, GstWebRTCBin * webrtc)
 {
   GstWebRTCDataChannelState ready_state;
-  guint i;
 
   g_object_get (channel, "ready-state", &ready_state, NULL);
 
   if (ready_state == GST_WEBRTC_DATA_CHANNEL_STATE_OPEN) {
-    gboolean found = FALSE;
+    gboolean found;
 
-    for (i = 0; i < webrtc->priv->pending_data_channels->len; i++) {
-      WebRTCDataChannel *c;
-
-      c = g_ptr_array_index (webrtc->priv->pending_data_channels, i);
-      if (c == channel) {
-        found = TRUE;
-        g_ptr_array_remove_index (webrtc->priv->pending_data_channels, i);
-        break;
-      }
-    }
+    DC_LOCK (webrtc);
+    found = g_ptr_array_remove (webrtc->priv->pending_data_channels, channel);
     if (found == FALSE) {
       GST_FIXME_OBJECT (webrtc, "Received open for unknown data channel");
+      DC_UNLOCK (webrtc);
       return;
     }
 
-    g_ptr_array_add (webrtc->priv->data_channels, channel);
+    g_ptr_array_add (webrtc->priv->data_channels, gst_object_ref (channel));
+    DC_UNLOCK (webrtc);
 
     gst_webrtc_bin_update_sctp_priority (webrtc);
 
     g_signal_emit (webrtc, gst_webrtc_bin_signals[ON_DATA_CHANNEL_SIGNAL], 0,
-        gst_object_ref (channel));
+        channel);
+  } else if (ready_state == GST_WEBRTC_DATA_CHANNEL_STATE_CLOSED) {
+    gboolean found;
+
+    DC_LOCK (webrtc);
+    found = g_ptr_array_remove (webrtc->priv->pending_data_channels, channel)
+        || g_ptr_array_remove (webrtc->priv->data_channels, channel);
+
+    if (found == FALSE) {
+      GST_FIXME_OBJECT (webrtc, "Received close for unknown data channel");
+    }
+    DC_UNLOCK (webrtc);
   }
 }
 
@@ -1997,7 +2164,7 @@ _on_sctpdec_pad_added (GstElement * sctpdec, GstPad * pad,
   if (sscanf (GST_PAD_NAME (pad), "src_%u", &stream_id) != 1)
     return;
 
-  PC_LOCK (webrtc);
+  DC_LOCK (webrtc);
   channel = _find_data_channel_for_id (webrtc, stream_id);
   if (!channel) {
     channel = g_object_new (WEBRTC_TYPE_DATA_CHANNEL, NULL);
@@ -2014,6 +2181,7 @@ _on_sctpdec_pad_added (GstElement * sctpdec, GstPad * pad,
 
     g_ptr_array_add (webrtc->priv->pending_data_channels, channel);
   }
+  DC_UNLOCK (webrtc);
 
   g_signal_connect (channel, "notify::ready-state",
       G_CALLBACK (_on_data_channel_ready_state), webrtc);
@@ -2023,7 +2191,6 @@ _on_sctpdec_pad_added (GstElement * sctpdec, GstPad * pad,
     GST_WARNING_OBJECT (channel, "Failed to link sctp pad %s with channel %"
         GST_PTR_FORMAT, GST_PAD_NAME (pad), channel);
   gst_object_unref (sink_pad);
-  PC_UNLOCK (webrtc);
 }
 
 static void
@@ -2037,9 +2204,9 @@ _on_sctp_state_notify (GstWebRTCSCTPTransport * sctp, GParamSpec * pspec,
   if (state == GST_WEBRTC_SCTP_TRANSPORT_STATE_CONNECTED) {
     int i;
 
-    PC_LOCK (webrtc);
     GST_DEBUG_OBJECT (webrtc, "SCTP association established");
 
+    DC_LOCK (webrtc);
     for (i = 0; i < webrtc->priv->data_channels->len; i++) {
       WebRTCDataChannel *channel;
 
@@ -2050,7 +2217,7 @@ _on_sctp_state_notify (GstWebRTCSCTPTransport * sctp, GParamSpec * pspec,
       if (!channel->parent.negotiated && !channel->opened)
         webrtc_data_channel_start_negotiation (channel);
     }
-    PC_UNLOCK (webrtc);
+    DC_UNLOCK (webrtc);
   }
 }
 
@@ -2153,7 +2320,6 @@ _get_or_create_data_channel_transports (GstWebRTCBin * webrtc, guint session_id)
   if (!webrtc->priv->data_channel_transport) {
     TransportStream *stream;
     GstWebRTCSCTPTransport *sctp_transport;
-    int i;
 
     stream = _find_transport_for_session (webrtc, session_id);
 
@@ -2202,14 +2368,6 @@ _get_or_create_data_channel_transports (GstWebRTCBin * webrtc, guint session_id)
             GST_ELEMENT (stream->send_bin), "data_sink"))
       g_warn_if_reached ();
 
-    for (i = 0; i < webrtc->priv->data_channels->len; i++) {
-      WebRTCDataChannel *channel;
-
-      channel = g_ptr_array_index (webrtc->priv->data_channels, i);
-
-      webrtc_data_channel_link_to_sctp (channel, webrtc->priv->sctp_transport);
-    }
-
     gst_element_sync_state_with_parent (GST_ELEMENT (stream->send_bin));
     gst_element_sync_state_with_parent (GST_ELEMENT (stream->receive_bin));
 
@@ -2227,6 +2385,7 @@ _get_or_create_data_channel_transports (GstWebRTCBin * webrtc, guint session_id)
     }
 
     webrtc->priv->sctp_transport = sctp_transport;
+
     gst_webrtc_bin_update_sctp_priority (webrtc);
   }
 
@@ -2477,9 +2636,10 @@ _add_fingerprint_to_media (GstWebRTCDTLSTransport * transport,
 /* based off https://tools.ietf.org/html/draft-ietf-rtcweb-jsep-18#section-5.2.1 */
 static gboolean
 sdp_media_from_transceiver (GstWebRTCBin * webrtc, GstSDPMedia * media,
-    GstWebRTCRTPTransceiver * trans, GstWebRTCSDPType type, guint media_idx,
+    GstWebRTCRTPTransceiver * trans, guint media_idx,
     GString * bundled_mids, guint bundle_idx, gchar * bundle_ufrag,
-    gchar * bundle_pwd, GArray * reserved_pts, GHashTable * all_mids)
+    gchar * bundle_pwd, GArray * reserved_pts, GHashTable * all_mids,
+    GError ** error)
 {
   /* TODO:
    * rtp header extensions
@@ -2554,14 +2714,9 @@ sdp_media_from_transceiver (GstWebRTCBin * webrtc, GstSDPMedia * media,
   gst_sdp_media_add_attribute (media, direction, "");
   g_free (direction);
 
-  if (type == GST_WEBRTC_SDP_TYPE_OFFER) {
-    caps = _find_codec_preferences (webrtc, trans, GST_PAD_SINK, media_idx);
-    caps =
-        _add_supported_attributes_to_caps (webrtc, WEBRTC_TRANSCEIVER (trans),
-        caps);
-  } else {
-    g_assert_not_reached ();
-  }
+  caps = _find_codec_preferences (webrtc, trans, media_idx, error);
+  caps = _add_supported_attributes_to_caps (webrtc, WEBRTC_TRANSCEIVER (trans),
+      caps);
 
   if (!caps || gst_caps_is_empty (caps) || gst_caps_is_any (caps)) {
     GST_WARNING_OBJECT (webrtc, "no caps available for transceiver, skipping");
@@ -2586,7 +2741,7 @@ sdp_media_from_transceiver (GstWebRTCBin * webrtc, GstSDPMedia * media,
     gst_caps_unref (format);
   }
 
-  if (type == GST_WEBRTC_SDP_TYPE_OFFER) {
+  {
     const GstStructure *s = gst_caps_get_structure (caps, 0);
     gint clockrate = -1;
     gint rtx_target_pt;
@@ -2695,6 +2850,7 @@ gather_reserved_pts (GstWebRTCBin * webrtc)
     GstWebRTCRTPTransceiver *trans;
 
     trans = g_ptr_array_index (webrtc->priv->transceivers, i);
+    GST_OBJECT_LOCK (trans);
     if (trans->codec_preferences) {
       guint j, n;
       gint pt;
@@ -2709,6 +2865,7 @@ gather_reserved_pts (GstWebRTCBin * webrtc)
         }
       }
     }
+    GST_OBJECT_UNLOCK (trans);
   }
   GST_OBJECT_UNLOCK (webrtc);
 
@@ -3067,9 +3224,11 @@ _create_offer_task (GstWebRTCBin * webrtc, const GstStructure * options,
     GST_LOG_OBJECT (webrtc, "adding transceiver %" GST_PTR_FORMAT " at media "
         "index %u", trans, media_idx);
 
-    if (sdp_media_from_transceiver (webrtc, &media, trans,
-            GST_WEBRTC_SDP_TYPE_OFFER, media_idx, bundled_mids, 0, bundle_ufrag,
-            bundle_pwd, reserved_pts, all_mids)) {
+    if (sdp_media_from_transceiver (webrtc, &media, trans, media_idx,
+            bundled_mids, 0, bundle_ufrag, bundle_pwd, reserved_pts, all_mids,
+            error)) {
+      /* as per JSEP, a=rtcp-mux-only is only added for new streams */
+      gst_sdp_media_add_attribute (&media, "rtcp-mux-only", "");
       gst_sdp_message_add_media (ret, &media);
       media_idx++;
     } else {
@@ -3080,6 +3239,8 @@ _create_offer_task (GstWebRTCBin * webrtc, const GstStructure * options,
       g_array_free (reserved_pts, TRUE);
       reserved_pts = NULL;
     }
+    if (*error)
+      goto cancel_offer;
   }
 
   if (webrtc->bundle_policy != GST_WEBRTC_BUNDLE_POLICY_NONE) {
@@ -3461,26 +3622,33 @@ _create_answer_task (GstWebRTCBin * webrtc, const GstStructure * options,
             gst_sdp_message_get_media (last_answer, i);
         const gchar *last_mid =
             gst_sdp_media_get_attribute_val (last_media, "mid");
+        GstCaps *current_caps;
 
         /* FIXME: assumes no shenanigans with recycling transceivers */
         g_assert (g_strcmp0 (mid, last_mid) == 0);
 
-        if (!answer_caps
-            && (rtp_trans->direction ==
-                GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDRECV
-                || rtp_trans->direction ==
-                GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_RECVONLY))
-          answer_caps =
-              _find_codec_preferences (webrtc, rtp_trans, GST_PAD_SINK, i);
-        if (!answer_caps
-            && (rtp_trans->direction ==
-                GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDRECV
-                || rtp_trans->direction ==
-                GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY))
-          answer_caps =
-              _find_codec_preferences (webrtc, rtp_trans, GST_PAD_SRC, i);
-        if (!answer_caps)
-          answer_caps = _rtp_caps_from_media (last_media);
+        current_caps = _find_codec_preferences (webrtc, rtp_trans, i, error);
+        if (*error) {
+          gst_caps_unref (offer_caps);
+          goto rejected;
+        }
+        if (!current_caps)
+          current_caps = _rtp_caps_from_media (last_media);
+
+        if (current_caps) {
+          answer_caps = gst_caps_intersect (offer_caps, current_caps);
+          if (gst_caps_is_empty (answer_caps)) {
+            GST_WARNING_OBJECT (webrtc, "Caps from offer for m-line %d (%"
+                GST_PTR_FORMAT ") don't intersect with caps from codec"
+                " preferences and transceiver %" GST_PTR_FORMAT, i, offer_caps,
+                current_caps);
+            gst_caps_unref (current_caps);
+            gst_caps_unref (answer_caps);
+            gst_caps_unref (offer_caps);
+            goto rejected;
+          }
+          gst_caps_unref (current_caps);
+        }
 
         /* XXX: In theory we're meant to use the sendrecv formats for the
          * inactive direction however we don't know what that may be and would
@@ -3501,8 +3669,11 @@ _create_answer_task (GstWebRTCBin * webrtc, const GstStructure * options,
             continue;
           }
 
-          trans_caps =
-              _find_codec_preferences (webrtc, rtp_trans, GST_PAD_SINK, j);
+          trans_caps = _find_codec_preferences (webrtc, rtp_trans, j, error);
+          if (*error) {
+            gst_caps_unref (offer_caps);
+            goto rejected;
+          }
 
           GST_TRACE_OBJECT (webrtc, "trying to compare %" GST_PTR_FORMAT
               " and %" GST_PTR_FORMAT, offer_caps, trans_caps);
@@ -4503,6 +4674,7 @@ _update_data_channel_from_sdp_media (GstWebRTCBin * webrtc,
           remote_port, NULL);
   }
 
+  DC_LOCK (webrtc);
   for (i = 0; i < webrtc->priv->data_channels->len; i++) {
     WebRTCDataChannel *channel;
 
@@ -4520,6 +4692,7 @@ _update_data_channel_from_sdp_media (GstWebRTCBin * webrtc,
       webrtc_data_channel_start_negotiation (channel);
     }
   }
+  DC_UNLOCK (webrtc);
 
   stream->active = TRUE;
 
@@ -5493,7 +5666,9 @@ gst_webrtc_bin_add_transceiver (GstWebRTCBin * webrtc,
 
   rtp_trans = GST_WEBRTC_RTP_TRANSCEIVER (trans);
   if (caps) {
+    GST_OBJECT_LOCK (trans);
     rtp_trans->codec_preferences = gst_caps_ref (caps);
+    GST_OBJECT_UNLOCK (trans);
     _update_transceiver_kind_from_caps (rtp_trans, caps);
   }
 
@@ -5651,6 +5826,7 @@ gst_webrtc_bin_create_data_channel (GstWebRTCBin * webrtc, const gchar * label,
     return NULL;
 
   PC_LOCK (webrtc);
+  DC_LOCK (webrtc);
   /* check if the id has been used already */
   if (id != -1) {
     WebRTCDataChannel *channel = _find_data_channel_for_id (webrtc, id);
@@ -5658,6 +5834,7 @@ gst_webrtc_bin_create_data_channel (GstWebRTCBin * webrtc, const gchar * label,
       GST_ELEMENT_WARNING (webrtc, LIBRARY, SETTINGS,
           ("Attempting to add a data channel with a duplicate ID: %i", id),
           NULL);
+      DC_UNLOCK (webrtc);
       PC_UNLOCK (webrtc);
       return NULL;
     }
@@ -5670,6 +5847,7 @@ gst_webrtc_bin_create_data_channel (GstWebRTCBin * webrtc, const gchar * label,
     if (id == -1) {
       GST_ELEMENT_WARNING (webrtc, RESOURCE, NOT_FOUND,
           ("%s", "Failed to generate an identifier for a data channel"), NULL);
+      DC_UNLOCK (webrtc);
       PC_UNLOCK (webrtc);
       return NULL;
     }
@@ -5680,25 +5858,31 @@ gst_webrtc_bin_create_data_channel (GstWebRTCBin * webrtc, const gchar * label,
       "max-retransmits", max_retransmits, "protocol", protocol,
       "negotiated", negotiated, "id", id, "priority", priority, NULL);
 
-  if (ret) {
-    gst_bin_add (GST_BIN (webrtc), ret->appsrc);
-    gst_bin_add (GST_BIN (webrtc), ret->appsink);
+  if (!ret) {
+    DC_UNLOCK (webrtc);
+    PC_UNLOCK (webrtc);
+    return ret;
+  }
 
-    gst_element_sync_state_with_parent (ret->appsrc);
-    gst_element_sync_state_with_parent (ret->appsink);
+  gst_bin_add (GST_BIN (webrtc), ret->appsrc);
+  gst_bin_add (GST_BIN (webrtc), ret->appsink);
 
-    ret = gst_object_ref (ret);
-    ret->webrtcbin = webrtc;
-    g_ptr_array_add (webrtc->priv->data_channels, ret);
-    gst_webrtc_bin_update_sctp_priority (webrtc);
-    webrtc_data_channel_link_to_sctp (ret, webrtc->priv->sctp_transport);
-    if (webrtc->priv->sctp_transport &&
-        webrtc->priv->sctp_transport->association_established
-        && !ret->parent.negotiated) {
-      webrtc_data_channel_start_negotiation (ret);
-    } else {
-      _update_need_negotiation (webrtc);
-    }
+  gst_element_sync_state_with_parent (ret->appsrc);
+  gst_element_sync_state_with_parent (ret->appsink);
+
+  ret = gst_object_ref (ret);
+  ret->webrtcbin = webrtc;
+  g_ptr_array_add (webrtc->priv->data_channels, ret);
+  DC_UNLOCK (webrtc);
+
+  gst_webrtc_bin_update_sctp_priority (webrtc);
+  webrtc_data_channel_link_to_sctp (ret, webrtc->priv->sctp_transport);
+  if (webrtc->priv->sctp_transport &&
+      webrtc->priv->sctp_transport->association_established
+      && !ret->parent.negotiated) {
+    webrtc_data_channel_start_negotiation (ret);
+  } else {
+    _update_need_negotiation (webrtc);
   }
 
   PC_UNLOCK (webrtc);
@@ -6390,14 +6574,17 @@ gst_webrtc_bin_request_new_pad (GstElement * element, GstPadTemplate * templ,
       }
 
       if (caps) {
+        GST_OBJECT_LOCK (trans);
         if (trans->codec_preferences &&
             !gst_caps_can_intersect (caps, trans->codec_preferences)) {
           GST_ERROR_OBJECT (element, "Tried to request a new sink pad %s for"
               " existing m-line %d, but requested caps %" GST_PTR_FORMAT
               " don't match existing codec preferences %" GST_PTR_FORMAT,
               name, serial, caps, trans->codec_preferences);
+          GST_OBJECT_UNLOCK (trans);
           goto error_out;
         }
+        GST_OBJECT_UNLOCK (trans);
 
         if (trans->kind != GST_WEBRTC_KIND_UNKNOWN) {
           GstWebRTCKind kind = webrtc_kind_from_caps (caps);
@@ -6426,6 +6613,7 @@ gst_webrtc_bin_request_new_pad (GstElement * element, GstPadTemplate * templ,
       GstWebRTCRTPTransceiver *tmptrans =
           g_ptr_array_index (webrtc->priv->transceivers, i);
       GstWebRTCBinPad *pad2;
+      gboolean has_matching_caps;
 
       /* Ignore transceivers with a non-matching kind */
       if (tmptrans->kind != GST_WEBRTC_KIND_UNKNOWN &&
@@ -6449,11 +6637,13 @@ gst_webrtc_bin_request_new_pad (GstElement * element, GstPadTemplate * templ,
         continue;
       }
 
+      GST_OBJECT_LOCK (tmptrans);
+      has_matching_caps = (caps && tmptrans->codec_preferences &&
+          !gst_caps_can_intersect (caps, tmptrans->codec_preferences));
+      GST_OBJECT_UNLOCK (tmptrans);
       /* Ignore transceivers with non-matching caps */
-      if (caps && tmptrans->codec_preferences &&
-          !gst_caps_can_intersect (caps, tmptrans->codec_preferences)) {
+      if (!has_matching_caps)
         continue;
-      }
 
       trans = tmptrans;
       break;
@@ -6757,6 +6947,7 @@ gst_webrtc_bin_finalize (GObject * object)
     gst_webrtc_session_description_free (webrtc->priv->last_generated_offer);
   webrtc->priv->last_generated_offer = NULL;
 
+  g_mutex_clear (DC_GET_LOCK (webrtc));
   g_mutex_clear (ICE_GET_LOCK (webrtc));
   g_mutex_clear (PC_GET_LOCK (webrtc));
   g_cond_clear (PC_GET_COND (webrtc));
@@ -6924,7 +7115,8 @@ gst_webrtc_bin_class_init (GstWebRTCBinClass * klass)
       PROP_LATENCY,
       g_param_spec_uint ("latency", "Latency",
           "Default duration to buffer in the jitterbuffers (in ms)",
-          0, G_MAXUINT, 200, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+          0, G_MAXUINT, DEFAULT_JB_LATENCY,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   /**
    * GstWebRTCBin::create-offer:
@@ -7220,6 +7412,7 @@ gst_webrtc_bin_init (GstWebRTCBin * webrtc)
   g_cond_init (PC_GET_COND (webrtc));
 
   g_mutex_init (ICE_GET_LOCK (webrtc));
+  g_mutex_init (DC_GET_LOCK (webrtc));
 
   webrtc->rtpbin = _create_rtpbin (webrtc);
   gst_bin_add (GST_BIN (webrtc), webrtc->rtpbin);
@@ -7249,4 +7442,5 @@ gst_webrtc_bin_init (GstWebRTCBin * webrtc)
 
   /* we start off closed until we move to READY */
   webrtc->priv->is_closed = TRUE;
+  webrtc->priv->jb_latency = DEFAULT_JB_LATENCY;
 }
